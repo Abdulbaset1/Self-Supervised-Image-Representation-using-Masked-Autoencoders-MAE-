@@ -7,8 +7,12 @@ from PIL import Image
 import numpy as np
 import matplotlib.pyplot as plt
 import requests
-import io
 import os
+import io
+import sys
+
+# Disable matplotlib interactive mode to avoid issues
+plt.switch_backend('Agg')
 
 # Configuration
 PATCH = 16
@@ -76,8 +80,8 @@ class MAE(nn.Module):
         self.head = nn.Linear(384, PATCH * PATCH * 3)
 
     def forward(self, imgs):
-        patches = patchify(imgs)
-        visible, mask, ids_restore = random_masking(patches)
+        patches = self.patchify(imgs)
+        visible, mask, ids_restore = self.random_masking(patches)
         
         # encoder
         x = visible + self.pos_embed_enc[:, :visible.shape[1]]
@@ -114,7 +118,49 @@ class MAE(nn.Module):
         pred = self.head(x_)
         
         return pred, patches, mask
+    
+    def patchify(self, imgs):
+        B, C, H, W = imgs.shape
+        patches = imgs.unfold(2, PATCH, PATCH).unfold(3, PATCH, PATCH)
+        patches = patches.contiguous().view(B, C, -1, PATCH, PATCH)
+        patches = patches.permute(0, 2, 1, 3, 4)
+        patches = patches.reshape(B, -1, PATCH * PATCH * C)
+        return patches
+    
+    def unpatchify(self, patches):
+        B, N, D = patches.shape
+        p = PATCH
+        h = w = int(N ** 0.5)
+        
+        patches = patches.reshape(B, h, w, 3, p, p)
+        patches = patches.permute(0, 3, 1, 4, 2, 5)
+        imgs = patches.reshape(B, 3, h * p, w * p)
+        
+        return imgs
+    
+    def random_masking(self, x, mask_ratio=0.75):
+        B, N, D = x.shape
+        len_keep = int(N * (1 - mask_ratio))
+        
+        noise = torch.rand(B, N, device=x.device)
+        
+        ids_shuffle = torch.argsort(noise, dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+        
+        ids_keep = ids_shuffle[:, :len_keep]
+        
+        x_visible = torch.gather(
+            x, 1,
+            ids_keep.unsqueeze(-1).repeat(1, 1, D)
+        )
+        
+        mask = torch.ones(B, N, device=x.device)
+        mask[:, :len_keep] = 0
+        mask = torch.gather(mask, 1, ids_restore)
+        
+        return x_visible, mask, ids_restore
 
+# Global functions for patchify and unpatchify
 def patchify(imgs):
     B, C, H, W = imgs.shape
     patches = imgs.unfold(2, PATCH, PATCH).unfold(3, PATCH, PATCH)
@@ -169,24 +215,40 @@ def load_model():
     if not os.path.exists(model_path):
         with st.spinner("Downloading model from GitHub release..."):
             try:
-                response = requests.get(MODEL_URL)
+                # Add headers to avoid rate limiting
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+                response = requests.get(MODEL_URL, headers=headers, stream=True)
                 response.raise_for_status()
-                with open(model_path, "wb") as f:
-                    f.write(response.content)
+                
+                # Download with progress bar
+                progress_bar = st.progress(0)
+                total_size = int(response.headers.get('content-length', 0))
+                
+                with open(model_path, 'wb') as f:
+                    downloaded = 0
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total_size > 0:
+                            progress = min(downloaded / total_size, 1.0)
+                            progress_bar.progress(progress)
+                
+                progress_bar.empty()
                 st.success("Model downloaded successfully!")
             except Exception as e:
-                st.error(f"Error downloading model: {e}")
-                return None
+                st.error(f"Error downloading model: {str(e)}")
+                return None, None
     
     # Load model
     try:
-        model = MAE().to(device)
         # Load the traced model
         model = torch.jit.load(model_path, map_location=device)
         model.eval()
         return model, device
     except Exception as e:
-        st.error(f"Error loading model: {e}")
+        st.error(f"Error loading model: {str(e)}")
         return None, None
 
 def preprocess_image(image):
@@ -210,12 +272,8 @@ def reconstruct_image(model, img_tensor, device, mask_ratio=0.75):
     with torch.no_grad():
         img_tensor = img_tensor.to(device)
         
-        # Create patches and apply masking
-        patches = patchify(img_tensor)
-        visible, mask, ids_restore = random_masking(patches, mask_ratio=mask_ratio)
-        
         # Forward pass
-        pred, _, _ = model(img_tensor)
+        pred, patches, mask = model(img_tensor)
         
         # Reconstruct both masked and complete images
         reconstructed = unpatchify(pred)
@@ -253,82 +311,88 @@ def main():
         st.error("Failed to load model. Please check your internet connection and try again.")
         return
     
-    st.sidebar.success(f"✅ Model loaded successfully on {device.upper()}")
+    st.sidebar.success(f"✅ Model loaded successfully")
     
     # Image upload
     st.header("📤 Upload an Image")
     uploaded_file = st.file_uploader(
         "Choose an image...",
-        type=['jpg', 'jpeg', 'png', 'bmp', 'tiff']
+        type=['jpg', 'jpeg', 'png', 'bmp']
     )
-    
-    col1, col2 = st.columns(2)
     
     if uploaded_file is not None:
         # Load and display original image
         image = Image.open(uploaded_file)
         
+        col1, col2 = st.columns(2)
+        
         with col1:
             st.subheader("Original Image")
-            st.image(image, use_column_width=True)
+            st.image(image, use_container_width=True)
         
         # Process button
         if st.button("🎨 Reconstruct Image", type="primary"):
             with st.spinner("Processing image..."):
-                # Preprocess
-                img_tensor = preprocess_image(image)
-                
-                # Reconstruct
-                reconstructed, masked_input, mask = reconstruct_image(
-                    model, img_tensor, device, mask_ratio
-                )
-                
-                # Convert tensors to displayable format
-                def tensor_to_image(tensor):
-                    img = tensor.permute(1, 2, 0).numpy()
-                    img = np.clip(img, 0, 1)
-                    return img
-                
-                masked_img_display = tensor_to_image(masked_input)
-                reconstructed_img_display = tensor_to_image(reconstructed)
-                
-                # Display results
-                with col2:
-                    st.subheader("Reconstructed Image")
-                    st.image(reconstructed_img_display, use_column_width=True)
-                
-                # Additional visualizations
-                st.header("📊 Visualization Results")
-                
-                col3, col4 = st.columns(2)
-                
-                with col3:
-                    st.subheader("Masked Input")
-                    st.image(masked_img_display, use_column_width=True)
-                    st.caption(f"Mask Ratio: {mask_ratio:.0%}")
-                
-                with col4:
-                    # Display mask pattern
-                    st.subheader("Mask Pattern")
-                    mask_vis = mask.reshape(14, 14).numpy()  # 224/16 = 14
-                    fig, ax = plt.subplots(figsize=(6, 6))
-                    im = ax.imshow(mask_vis, cmap='gray', vmin=0, vmax=1)
-                    ax.set_title("Masked Patches (White = Masked)")
-                    ax.set_xticks([])
-                    ax.set_yticks([])
-                    plt.colorbar(im, ax=ax)
-                    st.pyplot(fig)
-                
-                # Metrics
-                st.header("📈 Reconstruction Metrics")
-                mse = torch.mean((reconstructed - img_tensor[0].cpu()) ** 2).item()
-                psnr = 20 * np.log10(1.0 / np.sqrt(mse)) if mse > 0 else float('inf')
-                
-                metric_col1, metric_col2 = st.columns(2)
-                with metric_col1:
-                    st.metric("MSE (Lower is better)", f"{mse:.4f}")
-                with metric_col2:
-                    st.metric("PSNR (Higher is better)", f"{psnr:.2f} dB")
+                try:
+                    # Preprocess
+                    img_tensor = preprocess_image(image)
+                    
+                    # Reconstruct
+                    reconstructed, masked_input, mask = reconstruct_image(
+                        model, img_tensor, device, mask_ratio
+                    )
+                    
+                    # Convert tensors to displayable format
+                    def tensor_to_image(tensor):
+                        img = tensor.permute(1, 2, 0).numpy()
+                        img = np.clip(img, 0, 1)
+                        return img
+                    
+                    masked_img_display = tensor_to_image(masked_input)
+                    reconstructed_img_display = tensor_to_image(reconstructed)
+                    
+                    # Display results
+                    with col2:
+                        st.subheader("Reconstructed Image")
+                        st.image(reconstructed_img_display, use_container_width=True)
+                    
+                    # Additional visualizations
+                    st.header("📊 Visualization Results")
+                    
+                    col3, col4 = st.columns(2)
+                    
+                    with col3:
+                        st.subheader("Masked Input")
+                        st.image(masked_img_display, use_container_width=True)
+                        st.caption(f"Mask Ratio: {mask_ratio:.0%}")
+                    
+                    with col4:
+                        # Display mask pattern
+                        st.subheader("Mask Pattern")
+                        mask_vis = mask.reshape(14, 14).numpy()  # 224/16 = 14
+                        fig, ax = plt.subplots(figsize=(6, 6))
+                        im = ax.imshow(mask_vis, cmap='gray', vmin=0, vmax=1)
+                        ax.set_title("Masked Patches (White = Masked)")
+                        ax.set_xticks([])
+                        ax.set_yticks([])
+                        plt.colorbar(im, ax=ax)
+                        st.pyplot(fig)
+                        plt.close(fig)
+                    
+                    # Metrics
+                    st.header("📈 Reconstruction Metrics")
+                    mse = float(torch.mean((reconstructed - img_tensor[0].cpu()) ** 2).item())
+                    psnr = 20 * np.log10(1.0 / np.sqrt(mse)) if mse > 0 else float('inf')
+                    
+                    metric_col1, metric_col2 = st.columns(2)
+                    with metric_col1:
+                        st.metric("MSE (Lower is better)", f"{mse:.4f}")
+                    with metric_col2:
+                        st.metric("PSNR (Higher is better)", f"{psnr:.2f} dB")
+                        
+                except Exception as e:
+                    st.error(f"Error during reconstruction: {str(e)}")
+                    st.exception(e)
     
     else:
         # Show example when no image is uploaded
