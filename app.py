@@ -8,8 +8,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import requests
 import os
+import sys
 
-# Set matplotlib backend to 'Agg' for headless environments
+# Set matplotlib backend
 import matplotlib
 matplotlib.use('Agg')
 
@@ -139,23 +140,38 @@ def load_model():
     if not os.path.exists(model_path):
         with st.spinner("Downloading model (this may take a minute)..."):
             try:
-                response = requests.get(MODEL_URL, stream=True)
+                # Use requests with stream
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                response = requests.get(MODEL_URL, headers=headers, stream=True)
                 response.raise_for_status()
+                
+                # Show progress
+                progress_bar = st.progress(0)
+                total_size = int(response.headers.get('content-length', 0))
+                downloaded = 0
+                
                 with open(model_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
-                st.success("Model downloaded!")
+                        downloaded += len(chunk)
+                        if total_size > 0:
+                            progress_bar.progress(min(downloaded / total_size, 1.0))
+                
+                progress_bar.empty()
+                st.success("✅ Model downloaded successfully!")
             except Exception as e:
-                st.error(f"Download failed: {str(e)}")
+                st.error(f"❌ Download failed: {str(e)}")
                 return None, None
     
     # Load model
     try:
+        # Try loading as traced JIT model
         model = torch.jit.load(model_path, map_location=device)
         model.eval()
         return model, device
     except Exception as e:
-        st.error(f"Model loading failed: {str(e)}")
+        st.error(f"❌ Model loading failed: {str(e)}")
+        st.info("The model file might be corrupted or incompatible. Try deleting the existing model file and restarting.")
         return None, None
 
 def preprocess_image(image):
@@ -170,38 +186,57 @@ def preprocess_image(image):
     return img_tensor.unsqueeze(0)
 
 def main():
-    st.title("🖼️ Masked Autoencoder (MAE) Image Reconstruction")
-    st.markdown("Reconstruct images from masked patches using Vision Transformer")
+    st.title("🎨 Masked Autoencoder (MAE) Image Reconstruction")
+    st.markdown("""
+    <div style='text-align: center'>
+    <p>Reconstruct images from masked patches using Vision Transformer based Masked Autoencoder</p>
+    </div>
+    """, unsafe_allow_html=True)
     
     # Sidebar
     with st.sidebar:
-        st.header("Settings")
-        mask_ratio = st.slider("Mask Ratio", 0.1, 0.9, 0.75, 0.05)
+        st.header("⚙️ Settings")
+        mask_ratio = st.slider(
+            "Mask Ratio", 
+            min_value=0.1, 
+            max_value=0.9, 
+            value=0.75, 
+            step=0.05,
+            help="Percentage of image patches to mask (higher = more challenging reconstruction)"
+        )
         
-        st.header("Model Status")
+        st.header("📦 Model Status")
         model, device = load_model()
         
         if model is not None:
-            st.success("✅ Model ready")
+            st.success("✅ Model loaded and ready!")
+            st.info(f"Running on: {device.upper()}")
         else:
             st.error("❌ Model failed to load")
-            return
+            st.stop()
     
     # Main content
-    uploaded_file = st.file_uploader("Upload an image", type=['jpg', 'jpeg', 'png'])
+    st.header("📤 Upload Image")
+    uploaded_file = st.file_uploader(
+        "Choose an image file",
+        type=['jpg', 'jpeg', 'png', 'bmp', 'tiff'],
+        help="Upload any image (will be resized to 224x224)"
+    )
     
     if uploaded_file is not None:
+        # Load and display original image
         image = Image.open(uploaded_file)
         
         col1, col2 = st.columns(2)
         with col1:
-            st.subheader("Original")
+            st.subheader("🖼️ Original Image")
             st.image(image, use_container_width=True)
         
-        if st.button("Reconstruct", type="primary"):
-            with st.spinner("Processing..."):
+        # Process button
+        if st.button("🚀 Reconstruct Image", type="primary", use_container_width=True):
+            with st.spinner("🧠 Processing image through MAE model..."):
                 try:
-                    # Process image
+                    # Preprocess image
                     img_tensor = preprocess_image(image).to(device)
                     
                     # Run model
@@ -214,47 +249,113 @@ def main():
                     masked_input[mask.bool()] = 0
                     masked_img = unpatchify(masked_input)[0].cpu()
                     
-                    # Display results
+                    # Display reconstructed image
                     with col2:
-                        st.subheader("Reconstructed")
+                        st.subheader("🔄 Reconstructed Image")
                         img_display = reconstructed.permute(1, 2, 0).numpy()
                         img_display = np.clip(img_display, 0, 1)
                         st.image(img_display, use_container_width=True)
                     
-                    # Show side-by-side comparison
-                    st.subheader("Comparison")
-                    comp_col1, comp_col2 = st.columns(2)
+                    # Show detailed visualizations
+                    st.markdown("---")
+                    st.subheader("📊 Detailed Analysis")
                     
-                    with comp_col1:
-                        st.caption("Masked Input")
+                    tab1, tab2, tab3 = st.tabs(["Masked Input", "Mask Pattern", "Metrics"])
+                    
+                    with tab1:
+                        st.caption("Image with masked patches (black = masked)")
                         masked_display = masked_img.permute(1, 2, 0).numpy()
                         masked_display = np.clip(masked_display, 0, 1)
                         st.image(masked_display, use_container_width=True)
                     
-                    with comp_col2:
-                        st.caption("Mask Pattern")
+                    with tab2:
+                        st.caption("Visualization of which patches were masked")
                         mask_vis = mask[0].cpu().reshape(14, 14).numpy()
-                        fig, ax = plt.subplots(figsize=(6, 6))
-                        ax.imshow(mask_vis, cmap='gray', vmin=0, vmax=1)
-                        ax.set_title(f"Mask Ratio: {mask_ratio:.0%}")
-                        ax.axis('off')
+                        fig, ax = plt.subplots(figsize=(8, 8))
+                        im = ax.imshow(mask_vis, cmap='RdYlBu_r', vmin=0, vmax=1)
+                        ax.set_title(f"Mask Pattern (Mask Ratio: {mask_ratio:.0%})", fontsize=14)
+                        ax.set_xticks(range(0, 14, 2))
+                        ax.set_yticks(range(0, 14, 2))
+                        ax.set_xlabel("Patch X coordinate")
+                        ax.set_ylabel("Patch Y coordinate")
+                        plt.colorbar(im, ax=ax, label="Masked (1) / Visible (0)")
                         st.pyplot(fig)
                         plt.close()
                     
+                    with tab3:
+                        # Calculate metrics
+                        mse = float(torch.mean((reconstructed - img_tensor[0].cpu()) ** 2).item())
+                        psnr = 20 * np.log10(1.0 / np.sqrt(mse)) if mse > 0 else float('inf')
+                        
+                        col_m1, col_m2 = st.columns(2)
+                        with col_m1:
+                            st.metric(
+                                "Mean Squared Error (MSE)", 
+                                f"{mse:.6f}",
+                                help="Lower is better - measures pixel-wise difference"
+                            )
+                        with col_m2:
+                            st.metric(
+                                "Peak Signal-to-Noise Ratio (PSNR)", 
+                                f"{psnr:.2f} dB",
+                                help="Higher is better - measures reconstruction quality"
+                            )
+                        
+                        st.info(f"""
+                        **Interpretation:**
+                        - MSE < 0.01: Excellent reconstruction
+                        - MSE 0.01-0.05: Good reconstruction
+                        - MSE > 0.05: Poor reconstruction
+                        
+                        PSNR > 30 dB: Excellent quality
+                        PSNR 20-30 dB: Good quality
+                        PSNR < 20 dB: Poor quality
+                        """)
+                    
                 except Exception as e:
-                    st.error(f"Error: {str(e)}")
+                    st.error(f"❌ Error during reconstruction: {str(e)}")
+                    st.exception(e)
     
     else:
-        st.info("👈 Upload an image to get started!")
+        # Show placeholder when no image uploaded
+        st.info("👈 **Get Started:** Upload an image from the sidebar to begin!")
         
-        with st.expander("ℹ️ About"):
+        with st.expander("ℹ️ **About This Model**", expanded=True):
             st.markdown("""
-            **Masked Autoencoder (MAE)** 
-            - Trained on Tiny ImageNet
-            - Vision Transformer Base encoder
-            - Reconstructs images from 75% masked patches
-            - Demonstrates self-supervised learning
+            ### 🧠 Masked Autoencoder (MAE)
+            
+            This model implements **Masked Autoencoder** for self-supervised image representation learning.
+            
+            **Architecture Details:**
+            - **Encoder:** Vision Transformer Base (12 layers, 768 dimensions, 12 attention heads)
+            - **Decoder:** Vision Transformer Small (12 layers, 384 dimensions, 6 attention heads)
+            - **Patch Size:** 16×16 pixels
+            - **Input Size:** 224×224 pixels (14×14 patches)
+            - **Training Data:** Tiny ImageNet (200 classes)
+            
+            **How It Works:**
+            1. 📸 Image is divided into 196 patches
+            2. 🎭 Random patches are masked (hidden from the model)
+            3. 🔍 Encoder processes only visible patches
+            4. 🎨 Decoder reconstructs the full image from representations
+            5. 📈 Model learns to understand visual concepts without labels
+            
+            **Try It Out:**
+            - Upload any image (will be resized to 224×224)
+            - Adjust mask ratio to control difficulty
+            - See how well the model reconstructs masked regions
             """)
+        
+        # Example images section
+        st.markdown("---")
+        st.subheader("📸 Example Images You Can Try")
+        col_ex1, col_ex2, col_ex3 = st.columns(3)
+        with col_ex1:
+            st.markdown("**Animals** 🐱 - Cats, dogs, birds")
+        with col_ex2:
+            st.markdown("**Objects** 🚗 - Cars, furniture, food")
+        with col_ex3:
+            st.markdown("**Scenes** 🌄 - Landscapes, buildings")
 
 if __name__ == "__main__":
     main()
