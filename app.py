@@ -8,13 +8,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import requests
 import os
+import io
 
 # Set matplotlib backend
 import matplotlib
 matplotlib.use('Agg')
-
-# Force CPU usage
-device = torch.device("cpu")
 
 # Configuration
 PATCH = 16
@@ -28,7 +26,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# Define the complete model architecture (not relying on traced model)
+# Define the model architecture
 class TransformerBlock(nn.Module):
     def __init__(self, dim, heads):
         super().__init__()
@@ -132,14 +130,25 @@ def unpatchify(patches, patch_size=PATCH):
     imgs = patches.reshape(B, 3, h * p, w * p)
     return imgs
 
+class ModelWrapper:
+    """Wrapper to handle model inference without CUDA issues"""
+    def __init__(self, model):
+        self.model = model
+        self.device = torch.device('cpu')
+        self.model.to(self.device)
+        self.model.eval()
+    
+    def __call__(self, x):
+        return self.model(x)
+
 @st.cache_resource
 def load_model():
     """Load the MAE model weights from checkpoint"""
     model_path = "mae_deployment.pt"
-    state_dict_path = "mae_state_dict.pt"
+    weights_path = "model_weights.pth"
     
-    # First try to download the checkpoint
-    if not os.path.exists(model_path) and not os.path.exists(state_dict_path):
+    # Download model if not exists
+    if not os.path.exists(model_path) and not os.path.exists(weights_path):
         with st.spinner("Downloading model (this may take a minute)..."):
             try:
                 headers = {'User-Agent': 'Mozilla/5.0'}
@@ -164,45 +173,55 @@ def load_model():
                 st.error(f"❌ Download failed: {str(e)}")
                 return None
     
-    # Load model
+    # Load model weights
     try:
-        # Create model instance
-        model = MAE().to(device)
+        # Create new model instance (not traced)
+        model = MAE()
         
-        # Try loading as state dict first (if it's a checkpoint)
-        if os.path.exists(state_dict_path):
-            checkpoint = torch.load(state_dict_path, map_location=device)
-            if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
-            else:
-                model.load_state_dict(checkpoint)
-        elif os.path.exists(model_path):
-            # Try loading as traced model
+        # Try to load the weights
+        if os.path.exists(model_path):
+            st.info("Loading model weights...")
+            
+            # Check if it's a traced model or state dict
             try:
-                traced_model = torch.jit.load(model_path, map_location=device)
-                # Extract state dict from traced model (if possible)
-                st.info("Loading traced model...")
-                model = traced_model
-            except:
-                # Try as regular checkpoint
-                checkpoint = torch.load(model_path, map_location=device)
-                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                    model.load_state_dict(checkpoint['model_state_dict'])
-                elif isinstance(checkpoint, dict):
-                    model.load_state_dict(checkpoint)
+                # First try to load as state dict
+                checkpoint = torch.load(model_path, map_location='cpu')
+                
+                if isinstance(checkpoint, dict):
+                    if 'model_state_dict' in checkpoint:
+                        model.load_state_dict(checkpoint['model_state_dict'])
+                        st.success("✅ Loaded from checkpoint with model_state_dict")
+                    elif 'state_dict' in checkpoint:
+                        model.load_state_dict(checkpoint['state_dict'])
+                        st.success("✅ Loaded from checkpoint with state_dict")
+                    else:
+                        # Try to load directly
+                        model.load_state_dict(checkpoint)
+                        st.success("✅ Loaded from checkpoint directly")
                 else:
-                    st.warning("Using model as is...")
-                    model = checkpoint
+                    # It's a traced model, we need to extract weights differently
+                    st.warning("Traced model detected. Creating fresh model with compatible architecture...")
+                    # For traced models, we'll use the model as is but move to CPU
+                    traced_model = torch.jit.load(model_path, map_location='cpu')
+                    # Wrap the traced model
+                    return ModelWrapper(traced_model)
+                    
+            except Exception as e:
+                st.warning(f"Could not load as state dict: {str(e)}")
+                # Try as traced model
+                try:
+                    traced_model = torch.jit.load(model_path, map_location='cpu')
+                    return ModelWrapper(traced_model)
+                except Exception as e2:
+                    st.error(f"Failed to load model: {str(e2)}")
+                    return None
         
-        model.eval()
-        return model
+        # Wrap the model
+        return ModelWrapper(model)
+        
     except Exception as e:
         st.error(f"❌ Model loading failed: {str(e)}")
-        st.info("Attempting to create a new model with random weights for demonstration...")
-        # Fallback to random model for testing
-        model = MAE().to(device)
-        model.eval()
-        return model
+        return None
 
 def preprocess_image(image):
     """Preprocess the input image"""
@@ -213,7 +232,7 @@ def preprocess_image(image):
     if image.mode != 'RGB':
         image = image.convert('RGB')
     img_tensor = transform(image)
-    return img_tensor.unsqueeze(0).to(device)
+    return img_tensor.unsqueeze(0)
 
 def main():
     st.title("🎨 Masked Autoencoder (MAE) Image Reconstruction")
@@ -236,11 +255,11 @@ def main():
         )
         
         st.header("📦 Model Status")
-        model = load_model()
+        model_wrapper = load_model()
         
-        if model is not None:
+        if model_wrapper is not None:
             st.success("✅ Model loaded and ready!")
-            st.info(f"Running on: CPU")
+            st.info("Running on: CPU")
         else:
             st.error("❌ Model failed to load")
             st.stop()
@@ -271,12 +290,11 @@ def main():
                     
                     # Run model
                     with torch.no_grad():
-                        if isinstance(model, torch.jit.ScriptModule):
-                            # For traced models
-                            pred, patches, mask = model(img_tensor)
+                        if hasattr(model_wrapper.model, 'forward'):
+                            pred, patches, mask = model_wrapper.model(img_tensor)
                         else:
-                            # For regular models
-                            pred, patches, mask = model(img_tensor)
+                            # For traced models
+                            pred, patches, mask = model_wrapper.model(img_tensor)
                     
                     # Reconstruct images
                     reconstructed = unpatchify(pred)[0].cpu()
@@ -321,7 +339,7 @@ def main():
                     
                     with tab3:
                         # Calculate metrics
-                        mse = float(torch.mean((reconstructed - img_tensor[0].cpu()) ** 2).item())
+                        mse = float(torch.mean((reconstructed - img_tensor[0]) ** 2).item())
                         psnr = 20 * np.log10(1.0 / np.sqrt(mse)) if mse > 0 else float('inf')
                         
                         col_m1, col_m2 = st.columns(2)
@@ -339,14 +357,7 @@ def main():
                             )
                         
                         st.info(f"""
-                        **Interpretation:**
-                        - MSE < 0.01: Excellent reconstruction
-                        - MSE 0.01-0.05: Good reconstruction
-                        - MSE > 0.05: Poor reconstruction
-                        
-                        PSNR > 30 dB: Excellent quality
-                        PSNR 20-30 dB: Good quality
-                        PSNR < 20 dB: Poor quality
+                        **Note:** The model was trained on Tiny ImageNet. Results may vary based on image content.
                         """)
                     
                 except Exception as e:
@@ -377,10 +388,8 @@ def main():
             4. 🎨 Decoder reconstructs the full image from representations
             5. 📈 Model learns to understand visual concepts without labels
             
-            **Try It Out:**
-            - Upload any image (will be resized to 224×224)
-            - Adjust mask ratio to control difficulty
-            - See how well the model reconstructs masked regions
+            **Why CPU Only?** 
+            The model runs on CPU to ensure compatibility with Streamlit Cloud's free tier.
             """)
 
 if __name__ == "__main__":
